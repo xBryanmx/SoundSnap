@@ -400,6 +400,7 @@ let volume=0.8;
 let exclRoots=false;
 let pickQueues={}; // key -> {order:[], ptr:0, lastId:null} — one shuffle bag per genre|era|diff combo
 let diffStates={}; // difficulty -> saved round {curSong, guesses, clipIdx, finished, resultHTML}
+let recentlyPlayed=new Set(); // trackIds picked recently, used by pickSong() to avoid near-term repeats
 let searchCache={};
 
 // ── Genre matching ─────────────────────────────────────────────
@@ -953,6 +954,7 @@ async function loadPool(){
   }
   pickQueues={};
   diffStates={};
+  recentlyPlayed=new Set();
   setStatus('');
   return true;
 }
