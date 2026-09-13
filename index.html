@@ -980,14 +980,28 @@ function pickSong(){
   if(pq.ptr>=pq.order.length){
     pq.order=shuffledIndices(filtered.length);
     pq.ptr=0;
-    // avoid an immediate repeat right at the reshuffle boundary
     if(filtered.length>1 && pq.lastId!=null && filtered[pq.order[0]].trackId===pq.lastId){
       [pq.order[0],pq.order[1]]=[pq.order[1],pq.order[0]];
     }
   }
-  const song=filtered[pq.order[pq.ptr]];
-  pq.ptr++;
+  // Try to avoid recently played songs (up to 10 attempts)
+  let song=null;
+  for(let attempt=0;attempt<10;attempt++){
+    if(pq.ptr>=pq.order.length){ pq.order=shuffledIndices(filtered.length); pq.ptr=0; }
+    const candidate=filtered[pq.order[pq.ptr]];
+    pq.ptr++;
+    if(!recentlyPlayed.has(candidate.trackId)||recentlyPlayed.size>=filtered.length){
+      song=candidate; break;
+    }
+  }
+  if(!song) song=filtered[pq.order[Math.floor(Math.random()*pq.order.length)]];
   pq.lastId=song.trackId;
+  // Keep recently played capped at 50
+  recentlyPlayed.add(song.trackId);
+  if(recentlyPlayed.size>50){
+    const first=recentlyPlayed.values().next().value;
+    recentlyPlayed.delete(first);
+  }
   return song;
 }
 
@@ -1001,6 +1015,10 @@ function saveCurrentDiffState(){
     curSong, guesses:[...guesses], clipIdx, finished,
     resultHTML: finished ? document.getElementById('result-area').innerHTML : null
   };
+  // Stop any playing audio when leaving this difficulty
+  stopAudio();
+  if(resultAudio){ resultAudio.pause(); }
+  clearTimeout(resultPlayTO);
 }
 
 // Restore a previously-saved round for a difficulty. Returns false if
@@ -1010,15 +1028,29 @@ function restoreDiffState(d){
   const st=diffStates[d];
   if(!st) return false;
   stopAudio();
+  // Stop any result-card auto-play from the previous difficulty
+  if(resultAudio){ resultAudio.pause(); resultAudio=null; }
+  clearTimeout(resultPlayTO);
   curSong=st.curSong; guesses=[...st.guesses]; clipIdx=st.clipIdx;
   audio=null;
+  // Restore gameFinished based on whether that round was actually done
+  gameFinished = st.finished;
   buildWave();buildClips();updateClips();renderGuesses();buildSearch();
   if(st.finished){
     document.getElementById('game-area').style.display='none';
     const ra=document.getElementById('result-area');
     ra.style.display='block';
     ra.innerHTML=st.resultHTML;
+    // Restore the 15s pill state if finished
+    document.querySelectorAll('.cp').forEach((b,i)=>{
+      b.className='cp on'+(i===DIFFS[d].clips.length-1?' cur':'');
+    });
+    document.getElementById('ttot').textContent='of 15s';
+    document.getElementById('tcur').textContent='0.0s';
+    // Do NOT auto-play when switching back — only auto-play once on first finish
   }else{
+    // Not finished — make sure gameFinished is false so play button works normally
+    gameFinished=false;
     document.getElementById('game-area').style.display='block';
     document.getElementById('result-area').style.display='none';
     setStatus('Press play to start');
@@ -1061,6 +1093,12 @@ async function reroll(){
 // tab you're currently on.
 async function rerollAll(){
   diffStates={};
+  pickQueues={};
+  // Rotate the song pool so we don't start from the same position
+  if(songPool.length > 1){
+    const rotate = Math.floor(songPool.length * 0.3) + Math.floor(Math.random() * songPool.length * 0.4);
+    songPool = [...songPool.slice(rotate), ...songPool.slice(0, rotate)];
+  }
   await startGame();
 }
 
@@ -1086,9 +1124,11 @@ document.getElementById('diff-row').onclick=e=>{
   const newDiff=p.dataset.d;
   if(newDiff===selDiff) return;
   saveCurrentDiffState();
+  stopAudio();
+  gameFinished=false; // always reset so switching diff never leaks 15s mode
   setDiff(newDiff);
   if(!restoreDiffState(newDiff)){
-    startGame(); // haven't played this difficulty yet — deal a fresh song
+    startGame();
   }
 };
 document.querySelectorAll('.start-btn').forEach(b=>{
