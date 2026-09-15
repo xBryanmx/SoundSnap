@@ -151,10 +151,6 @@ header{padding:24px 0 14px;display:flex;align-items:center;justify-content:space
     </select>
     <select id="sel-era">
       <option value="">Any era</option>
-      <option value="1950">1950s</option>
-      <option value="1960">1960s</option>
-      <option value="1970">1970s</option>
-      <option value="1980">1980s</option>
       <option value="1990">1990s</option>
       <option value="2000">2000s</option>
       <option value="2010">2010s</option>
@@ -468,6 +464,20 @@ async function fetchCuratedSong(entry){
   }catch(e){ return null; }
 }
 
+// Some genre+era combos are historically almost empty — hip-hop as a
+// recorded genre barely existed before late 1979, for instance — so a
+// generic search often can't find genuinely-of-that-genre songs no matter
+// how it's phrased. This is a small curated list of guaranteed-real songs
+// for those specific gaps, looked up individually on iTunes the same way
+// as the FIFA/EA FC list, and prioritized ahead of the generic fallback.
+const ERA_GAP_FILLERS = {
+  'hiphop|1970': [
+    {t:'King Tim III (Personality Jock)', a:'The Fatback Band'},
+    {t:"Rapper's Delight", a:'The Sugarhill Gang'},
+    {t:"Christmas Rappin'", a:'Kurtis Blow'},
+  ],
+};
+
 async function fetchSongs(genre, era){
   const cacheKey=genre+'|'+era;
   if(searchCache[cacheKey]) return searchCache[cacheKey];
@@ -538,7 +548,7 @@ async function fetchSongs(genre, era){
     // years spanning music history, the same trick used for a specific
     // decade, so "Any era" doesn't lean entirely on a handful of the
     // most generically "relevant" (usually current) hits either.
-    const sampleYears = [1965,1975,1985,1995,2005,2015,2023];
+    const sampleYears = [1958,1965,1975,1985,1995,2005,2015,2020,2024,2026];
     const yearTerms = searchTerms.slice(0, 2);
     for(const y of sampleYears){
       for(const term of yearTerms){
@@ -579,6 +589,20 @@ async function fetchSongs(genre, era){
   }
 
   allSongs = rankSongs(s=>genreMatches(s, genre) && songInEra(s, era));
+
+  // Fill in known historical gaps with guaranteed-real songs for this
+  // specific genre+era combo (see ERA_GAP_FILLERS), looked up the same
+  // way as the FIFA curated list. These are genuinely of the right genre,
+  // so they're prioritized ahead of the generic search results.
+  if(ERA_GAP_FILLERS[cacheKey]){
+    const filler = await Promise.all(ERA_GAP_FILLERS[cacheKey].map(fetchCuratedSong));
+    const seenIds = new Set(allSongs.map(s=>s.trackId));
+    const newOnes = [];
+    for(const s of filler){
+      if(s && !seenIds.has(s.trackId)){ seenIds.add(s.trackId); newOnes.push(s); }
+    }
+    allSongs = newOnes.concat(allSongs);
+  }
 
   // If strict filter left too few, relax genre but keep era strict.
   // Flag this on the result so the UI can be upfront about it — some
