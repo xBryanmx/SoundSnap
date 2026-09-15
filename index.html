@@ -28,6 +28,7 @@ header{padding:24px 0 14px;display:flex;align-items:center;justify-content:space
 .excl-toggle{display:flex;align-items:center;gap:7px;background:var(--s2);border:1px solid var(--b2);border-radius:8px;padding:7px 12px;font-size:13px;color:var(--t2);cursor:pointer;user-select:none}
 .excl-toggle input{accent-color:var(--green);cursor:pointer}
 .excl-toggle:has(input:checked){border-color:var(--green);color:var(--green)}
+#genre-warning{background:#f39c1220;border:1px solid #f39c1260;border-radius:8px;padding:8px 12px;font-size:12.5px;color:#f39c12;margin-bottom:10px}
 .filter-row select{flex:1;min-width:120px;background:var(--s2);border:1px solid var(--b2);border-radius:8px;color:var(--t2);padding:8px 10px;font-size:13px;font-family:'Inter',sans-serif;cursor:pointer}
 .filter-row select:focus{outline:none;border-color:var(--green)}
 
@@ -165,6 +166,7 @@ header{padding:24px 0 14px;display:flex;align-items:center;justify-content:space
       <input type="checkbox" id="excl-roots"/> 🚫 No Country/Roots
     </label>
   </div>
+  <div id="genre-warning" style="display:none"></div>
 
   <!-- Difficulty -->
   <div class="diff-row" id="diff-row">
@@ -578,14 +580,20 @@ async function fetchSongs(genre, era){
 
   allSongs = rankSongs(s=>genreMatches(s, genre) && songInEra(s, era));
 
-  // If strict filter left too few, relax genre but keep era strict
-  if(allSongs.length < 10){
+  // If strict filter left too few, relax genre but keep era strict.
+  // Flag this on the result so the UI can be upfront about it — some
+  // genre+era combos are just historically near-empty (there's barely
+  // any real hip-hop from the 1970s, for instance), and silently filling
+  // the gap with unrelated songs is confusing without a note explaining why.
+  const strictCount = allSongs.length;
+  if(strictCount < 10){
     const relaxed = rankSongs(s=>songInEra(s, era));
     const seen = new Set(allSongs.map(s=>s.trackId));
     for(const s of relaxed){
       if(!seen.has(s.trackId)){ seen.add(s.trackId); allSongs.push(s); }
     }
   }
+  allSongs.relaxedInfo = (strictCount < 10) ? {strictCount} : null;
 
   searchCache[cacheKey] = allSongs;
   return allSongs;
@@ -939,6 +947,23 @@ async function loadPool(){
   let pool = await fetchSongs(selGenre, selEra);
   if(exclRoots && selGenre!=='roots'){
     pool = pool.filter(s=>!isRootsGenre(s));
+  }
+  // Let the player know when this genre+era combo doesn't actually have
+  // enough real matches and we had to fall back to other genres from the
+  // same era just to fill the pool — some combos are historically
+  // near-empty (there's barely any real hip-hop from the 1970s, for
+  // instance), so songs from other genres showing up isn't a bug.
+  const warn = document.getElementById('genre-warning');
+  if(pool.relaxedInfo && selEra){
+    const genreLabel = document.querySelector(`#sel-genre option[value="${selGenre}"]`)?.textContent.trim() || selGenre;
+    const eraLabel = document.querySelector(`#sel-era option[value="${selEra}"]`)?.textContent.trim() || selEra;
+    const n = pool.relaxedInfo.strictCount;
+    warn.textContent = n>0
+      ? `⚠️ Only ${n} real ${genreLabel} song${n!==1?'s':''} found for ${eraLabel} — filling the rest with popular songs from that era instead.`
+      : `⚠️ No real ${genreLabel} songs found for ${eraLabel} — showing popular songs from that era instead.`;
+    warn.style.display='block';
+  }else{
+    warn.style.display='none';
   }
   // NOTE: intentionally NOT shuffling this array. It's already ordered
   // most-to-least "well-known" (see rankSongs in fetchSongs), and
