@@ -445,10 +445,11 @@ function normForMatch(s){
 
 // Look up one curated {t: title, a: artist} entry on iTunes and return the
 // best-matching result (or null if nothing close enough was found).
-async function fetchCuratedSong(entry){
+async function fetchCuratedSong(entry, attempt=0){
   try{
     const url=`https://itunes.apple.com/search?term=${encodeURIComponent(entry.t+' '+entry.a)}&mediaType=music&limit=5&entity=song`;
     const res=await fetch(url);
+    if(!res.ok) throw new Error('iTunes search HTTP '+res.status);
     const data=await res.json();
     const results=(data.results||[]).filter(s=>s.previewUrl&&s.trackName&&s.artistName);
     const nTitle=normForMatch(entry.t), nArtist=normForMatch(entry.a);
@@ -461,7 +462,13 @@ async function fetchCuratedSong(entry){
     });
     if(!best) best = results[0]||null;
     return best;
-  }catch(e){ return null; }
+  }catch(e){
+    if(attempt<2){
+      await new Promise(r=>setTimeout(r, 300*(attempt+1)));
+      return fetchCuratedSong(entry, attempt+1);
+    }
+    return null;
+  }
 }
 
 // Some genre+era combos are historically almost empty — hip-hop as a
@@ -478,6 +485,30 @@ const ERA_GAP_FILLERS = {
   ],
 };
 
+// Run an array of no-arg async thunks with limited concurrency instead of
+// firing everything at once via Promise.all. This is the real fix for
+// "genres come back empty after switching a few times": each pool load
+// was firing 25-50+ simultaneous iTunes requests, and doing that
+// repeatedly in a short session is exactly what trips iTunes' rate
+// limiting. Batching keeps each burst small regardless of how many times
+// you've already switched genres this session.
+async function runThrottled(thunks, batchSize=8, delayMs=150){
+  const results=[];
+  for(let i=0;i<thunks.length;i+=batchSize){
+    const batch=thunks.slice(i,i+batchSize);
+    results.push(...await Promise.all(batch.map(fn=>fn())));
+    if(i+batchSize<thunks.length) await new Promise(r=>setTimeout(r,delayMs));
+  }
+  return results;
+}
+
+// Bumped whenever a new pool load starts. If a slower, older load finishes
+// after a newer one has already started, its result is discarded instead
+// of clobbering the current state — prevents overlapping genre/era
+// switches from compounding into an even bigger request burst than
+// throttling alone would already prevent.
+let loadGen = 0;
+
 async function fetchSongs(genre, era){
   const cacheKey=genre+'|'+era;
   if(searchCache[cacheKey]) return searchCache[cacheKey];
@@ -489,7 +520,7 @@ async function fetchSongs(genre, era){
   // instead of filtered by genre tag (these soundtracks span every genre).
   if(cfg.curated){
     setStatus('Loading FIFA & World Cup tracks...');
-    const found = await Promise.all(cfg.curated.map(fetchCuratedSong));
+    const found = await runThrottled(cfg.curated.map(entry=>()=>fetchCuratedSong(entry)));
     const seen = new Set();
     let allSongs = [];
     for(const s of found){
@@ -515,9 +546,26 @@ async function fetchSongs(genre, era){
   const LIMIT = 200; // iTunes Search API's actual documented max (was 100)
 
   const fetches = [];
-  const searchUrl = (term, extra='') =>
-    fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(term)}&mediaType=music&limit=${LIMIT}&entity=song${extra}`)
-      .then(r=>r.json()).then(d=>(d.results||[])).catch(()=>[]);
+  const searchUrl = async (term, extra='', attempt=0) => {
+    try{
+      const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(term)}&mediaType=music&limit=${LIMIT}&entity=song${extra}`);
+      // Same class of bug as the search-bar fix: fetch() only rejects on
+      // a true network failure. An HTTP-level error (e.g. a 429 rate-
+      // limit from the burst of ~20-25 concurrent requests a pool load
+      // fires at once) still comes back as a normal response with no
+      // `results` field, which silently became "zero songs" with no
+      // retry at all — this is what could make an entire genre look empty.
+      if(!res.ok) throw new Error('iTunes search HTTP '+res.status);
+      const data = await res.json();
+      return data.results||[];
+    }catch(e){
+      if(attempt<2){
+        await new Promise(r=>setTimeout(r, 300*(attempt+1)));
+        return searchUrl(term, extra, attempt+1);
+      }
+      return [];
+    }
+  };
 
   if(era && ERA_RANGES[era]){
     // iTunes search is relevance-based, not a real chart/decade browser —
@@ -529,18 +577,18 @@ async function fetchSongs(genre, era){
     const yearTerms = searchTerms.slice(0, 2);
     for(let y=startYear; y<=endYear; y++){
       for(const term of yearTerms){
-        fetches.push(searchUrl(y+' '+term));
+        fetches.push(()=>searchUrl(y+' '+term));
       }
     }
     // Broader decade-phrase queries across every configured term
     for(const term of searchTerms){
-      fetches.push(searchUrl(eraTerm+' '+term));
+      fetches.push(()=>searchUrl(eraTerm+' '+term));
     }
     // genreId queries sampled across a few years in the decade, across
     // every genre ID this category has (not just the first couple)
     for(const gid of genreIds){
       for(const y of [startYear, Math.floor((startYear+endYear)/2), endYear]){
-        fetches.push(searchUrl(String(y), `&genreId=${gid}`));
+        fetches.push(()=>searchUrl(String(y), `&genreId=${gid}`));
       }
     }
   }else{
@@ -552,19 +600,19 @@ async function fetchSongs(genre, era){
     const yearTerms = searchTerms.slice(0, 2);
     for(const y of sampleYears){
       for(const term of yearTerms){
-        fetches.push(searchUrl(y+' '+term));
+        fetches.push(()=>searchUrl(y+' '+term));
       }
     }
     for(const term of searchTerms){
-      fetches.push(searchUrl(term));
+      fetches.push(()=>searchUrl(term));
     }
     for(const gid of genreIds){
       const q = searchTerms[0]||genre;
-      fetches.push(searchUrl(q, `&genreId=${gid}`));
+      fetches.push(()=>searchUrl(q, `&genreId=${gid}`));
     }
   }
 
-  const results = await Promise.all(fetches);
+  const results = await runThrottled(fetches);
 
   // Merge + rank. Songs that turn up across more of our search queries,
   // and rank higher (closer to the top) within them, are a reasonable
@@ -595,7 +643,7 @@ async function fetchSongs(genre, era){
   // way as the FIFA curated list. These are genuinely of the right genre,
   // so they're prioritized ahead of the generic search results.
   if(ERA_GAP_FILLERS[cacheKey]){
-    const filler = await Promise.all(ERA_GAP_FILLERS[cacheKey].map(fetchCuratedSong));
+    const filler = await runThrottled(ERA_GAP_FILLERS[cacheKey].map(entry=>()=>fetchCuratedSong(entry)));
     const seenIds = new Set(allSongs.map(s=>s.trackId));
     const newOnes = [];
     for(const s of filler){
@@ -967,8 +1015,15 @@ function isRootsGenre(song){
 }
 
 async function loadPool(){
+  const myGen = ++loadGen;
   setStatus('Loading songs...');
   let pool = await fetchSongs(selGenre, selEra);
+  if(myGen!==loadGen){
+    // A newer genre/era switch started while this one was still in
+    // flight — its own loadPool() call will apply the current
+    // selection's result, so just bail out here instead of clobbering it.
+    return false;
+  }
   if(exclRoots && selGenre!=='roots'){
     pool = pool.filter(s=>!isRootsGenre(s));
   }
